@@ -12,6 +12,17 @@
 // ============================================================================
 package org.talend.components.snowflake;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.security.KeyFactory;
+import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.Base64;
+import java.util.EnumSet;
+import java.util.Optional;
 import java.util.Properties;
 
 import org.apache.commons.lang3.StringUtils;
@@ -20,6 +31,7 @@ import org.slf4j.LoggerFactory;
 import org.talend.components.api.properties.ComponentPropertiesImpl;
 import org.talend.components.api.properties.ComponentReferenceProperties;
 import org.talend.components.common.UserPasswordProperties;
+import org.talend.components.snowflake.tsnowflakeconnection.AuthenticationType;
 import org.talend.components.snowflake.tsnowflakeconnection.TSnowflakeConnectionDefinition;
 import org.talend.daikon.i18n.GlobalI18N;
 import org.talend.daikon.i18n.I18nMessages;
@@ -32,6 +44,10 @@ import org.talend.daikon.properties.property.Property;
 import org.talend.daikon.sandbox.SandboxedInstance;
 import org.talend.daikon.serialize.PostDeserializeSetup;
 import org.talend.daikon.serialize.migration.SerializeSetVersion;
+
+import javax.crypto.EncryptedPrivateKeyInfo;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
 
 import static org.talend.components.snowflake.SnowflakeDefinition.SOURCE_OR_SINK_CLASS;
 import static org.talend.components.snowflake.SnowflakeDefinition.USE_CURRENT_JVM_PROPS;
@@ -67,7 +83,14 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
 
     public Property<SnowflakeRegion> region = newEnum("region", SnowflakeRegion.class);
 
+    public Property<AuthenticationType> authenticationType = newEnum("authenticationType", AuthenticationType.class);
+
     public UserPasswordProperties userPassword = new UserPasswordProperties(USERPASSWORD);
+
+    public Property<String> keyPath = newString("keyPath");
+
+    public Property<String> keyPhrase =
+            newString("keyPhrase").setFlags(EnumSet.of(Property.Flags.ENCRYPT, Property.Flags.SUPPRESS_LOGGING));
 
     public Property<String> warehouse = newString("warehouse"); //$NON-NLS-1$
 
@@ -104,6 +127,8 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
         super.setupProperties();
         loginTimeout.setValue(DEFAULT_LOGIN_TIMEOUT);
         region.setValue(SnowflakeRegion.AWS_US_WEST);
+        authenticationType.setValue(AuthenticationType.BASIC);
+        keyPath.setValue("");
         useCustomRegion.setValue(false);
     }
 
@@ -115,7 +140,10 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
         wizardForm.addRow(name);
         wizardForm.addRow(account);
         wizardForm.addRow(region);
+        wizardForm.addRow(authenticationType);
         wizardForm.addRow(userPassword.getForm(Form.MAIN));
+        wizardForm.addRow(widget(keyPath).setWidgetType(Widget.FILE_WIDGET_TYPE));
+        wizardForm.addColumn(widget(keyPhrase).setWidgetType(Widget.HIDDEN_TEXT_WIDGET_TYPE));
         wizardForm.addRow(warehouse);
         wizardForm.addRow(schemaName);
         wizardForm.addRow(db);
@@ -125,7 +153,10 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
         Form mainForm = Form.create(this, Form.MAIN);
         mainForm.addRow(account);
         mainForm.addRow(region);
+        mainForm.addRow(authenticationType);
         mainForm.addRow(userPassword.getForm(Form.MAIN));
+        mainForm.addRow(widget(keyPath).setWidgetType(Widget.FILE_WIDGET_TYPE));
+        mainForm.addColumn(widget(keyPhrase).setWidgetType(Widget.HIDDEN_TEXT_WIDGET_TYPE));
         mainForm.addRow(warehouse);
         mainForm.addRow(schemaName);
         mainForm.addRow(db);
@@ -150,6 +181,11 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
         refreshLayout(getForm(FORM_WIZARD));
     }
 
+    public void afterAuthenticationType() {
+        refreshLayout(getForm(Form.MAIN));
+        refreshLayout(getForm(FORM_WIZARD));
+    }
+
     public void afterUseCustomRegion() {
         refreshLayout(getForm(Form.MAIN));
         refreshLayout(getForm(Form.REFERENCE));
@@ -167,6 +203,7 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
         form.getWidget(USERPASSWORD).setHidden(hidden);
         form.getWidget(account.getName()).setHidden(hidden);
         form.getWidget(region.getName()).setHidden(hidden);
+        form.getWidget(authenticationType.getName()).setHidden(hidden);
         form.getWidget(warehouse.getName()).setHidden(hidden);
         form.getWidget(schemaName.getName()).setHidden(hidden);
         form.getWidget(db.getName()).setHidden(hidden);
@@ -184,7 +221,10 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
                 setHiddenProps(form, false);
                 // Do nothing
                 form.setHidden(false);
-
+                boolean isBasicAuth = authenticationType.getValue() == AuthenticationType.BASIC;
+                userPassword.getForm(Form.MAIN).getWidget(userPassword.password.getName()).setHidden(!isBasicAuth);
+                form.getWidget(keyPath.getName()).setHidden(isBasicAuth);
+                form.getWidget(keyPhrase.getName()).setHidden(isBasicAuth);
                 form.getWidget(region.getName()).setHidden(useCustomRegion.getValue());
             }
         }
@@ -236,7 +276,7 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
         return null;
     }
 
-    public Properties getJdbcProperties() {
+    public Properties getJdbcProperties() throws Exception {
         String user = userPassword.userId.getStringValue();
         String password = userPassword.password.getStringValue();
         String loginTimeout = String.valueOf(this.loginTimeout.getValue());
@@ -246,9 +286,14 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
         if (user != null) {
             properties.put("user", user);
         }
-
-        if (password != null) {
-            properties.put("password", password);
+        if (AuthenticationType.BASIC == authenticationType.getValue()) {
+            if (password != null) {
+                properties.put("password", password);
+            }
+        } else {
+            if (keyPath.getValue() != null) {
+                properties.put("privateKey", getPrivateKey());
+            }
         }
 
         if (loginTimeout != null) {
@@ -256,6 +301,19 @@ public class SnowflakeConnectionProperties extends ComponentPropertiesImpl
         }
 
         return properties;
+    }
+
+    private PrivateKey getPrivateKey() throws Exception {
+        byte[] bytes = Files.readAllBytes(Paths.get(keyPath.getValue()));
+        String encrypted = new String(bytes)
+                .replace("-----BEGIN ENCRYPTED PRIVATE KEY-----", "")
+                .replace("-----END ENCRYPTED PRIVATE KEY-----", "");
+        EncryptedPrivateKeyInfo pkInfo = new EncryptedPrivateKeyInfo(Base64.getMimeDecoder().decode(encrypted));
+        SecretKeyFactory pbeKeyFactory = SecretKeyFactory.getInstance(pkInfo.getAlgName());
+        PBEKeySpec keySpec = new PBEKeySpec(keyPhrase.getValue().toCharArray());
+        PKCS8EncodedKeySpec encodedKeySpec = pkInfo.getKeySpec(pbeKeyFactory.generateSecret(keySpec));
+        KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+        return keyFactory.generatePrivate(encodedKeySpec);
     }
 
     public String getConnectionUrl() {
